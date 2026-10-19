@@ -71,6 +71,7 @@ func TestProcessor_BuilderMaxAge(t *testing.T) {
 		require.Equal(t, time.Now(), proc.firstAppend)
 		require.Equal(t, time.Now(), proc.lastAppend)
 		require.NotEqual(t, proc.builder.GetEstimatedSize(), 0)
+		require.NoError(t, proc.waitPendingFlush())
 		require.Equal(t, 1, flushCommitter.flushes)
 
 		// Advance time one last time and push some more logs. No flush should
@@ -110,6 +111,7 @@ func TestProcessor_FlushesWhenBuilderFull(t *testing.T) {
 		// Exactly one flush should have occurred, and the record should still
 		// have been appended afterwards, resetting firstAppend to the current
 		// time rather than the time of the first append.
+		require.NoError(t, proc.waitPendingFlush())
 		require.Equal(t, 1, flushCommitter.flushes)
 		require.NotEqual(t, flushedAt, proc.firstAppend)
 		require.Equal(t, time.Now(), proc.firstAppend)
@@ -155,6 +157,7 @@ func TestPartitionProcessor_IdleFlush(t *testing.T) {
 		flushed, err = proc.idleFlush(ctx)
 		require.NoError(t, err)
 		require.True(t, flushed)
+		require.NoError(t, proc.waitPendingFlush())
 		require.Equal(t, 1, flushCommitter.flushes)
 	})
 }
@@ -206,6 +209,7 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 			// Advance time and force a flush.
 			time.Sleep(time.Second)
 			require.NoError(t, proc.flush(ctx, "test"))
+			require.NoError(t, proc.waitPendingFlush())
 			require.Equal(t, 1, flushCommitter.flushes)
 
 			// The following fields should be reset at the end of every flush.
@@ -231,12 +235,13 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 			require.Equal(t, time.Now(), proc.lastAppend)
 			require.Equal(t, rec.Offset, proc.lastOffset)
 
-			// Advance time and force a flush. This flush should fail. Because the
-			// flusher is not re-entrant, a non-cancellation failure is escalated
-			// to an unrecoverable error so the partition processor restarts and
-			// replays from Kafka.
+			// Advance time and force a flush. The batch flushes in the
+			// background and fails. Because the flusher is not re-entrant, a
+			// non-cancellation failure is escalated to an unrecoverable error so
+			// the partition processor restarts and replays from Kafka.
 			time.Sleep(time.Second)
-			err := proc.flush(ctx, "forced")
+			require.NoError(t, proc.flush(ctx, "forced"))
+			err := proc.waitPendingFlush()
 			require.ErrorIs(t, err, errUnrecoverableFlush)
 			require.ErrorContains(t, err, "mock error")
 
@@ -262,7 +267,8 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 			require.NoError(t, proc.processRecord(ctx, newTestRecord(t, "tenant", time.Now())))
 
 			time.Sleep(time.Second)
-			err := proc.flush(ctx, "forced")
+			require.NoError(t, proc.flush(ctx, "forced"))
+			err := proc.waitPendingFlush()
 			require.ErrorIs(t, err, context.Canceled)
 			require.NotErrorIs(t, err, errUnrecoverableFlush)
 		})
@@ -294,6 +300,7 @@ func TestPartitionProcessor_FlushSplitsAcrossTenantsAndWindows(t *testing.T) {
 		require.Len(t, m.getBuilders(), 5)
 
 		require.NoError(t, proc.flush(ctx, "forced"))
+		require.NoError(t, proc.waitPendingFlush())
 		require.Equal(t, 1, flushCommitter.flushes)
 		require.Equal(t, 5, flushCommitter.lastBuilderCount)
 		require.Equal(t, rec.Offset, flushCommitter.lastOffset)
@@ -301,6 +308,138 @@ func TestPartitionProcessor_FlushSplitsAcrossTenantsAndWindows(t *testing.T) {
 		// The multi-builder is reset after a successful flush.
 		require.Empty(t, m.getBuilders())
 		require.Equal(t, 0, m.GetEstimatedSize())
+	})
+}
+
+func TestProcessor_ConsumeDuringFlush(t *testing.T) {
+	newProc := func(records chan *kgo.Record) (*processor, *mockMultiBuilder, *gatedFlushCommitter) {
+		m := newTestMultiBuilder()
+		flushCommitter := newGatedFlushCommitter()
+		proc := newProcessor(m, records, flushCommitter, 5*time.Minute, 30*time.Minute, log.NewNopLogger(), prometheus.NewRegistry())
+		return proc, m, flushCommitter
+	}
+	// waitRun fails the test if Run does not return within a minute of fake
+	// time. The idle flush timeout is longer, so an idle flush cannot hide a
+	// Run that does not return.
+	waitRun := func(t *testing.T, ran <-chan error) error {
+		select {
+		case err := <-ran:
+			return err
+		case <-time.After(time.Minute):
+			t.Fatal("Run did not return")
+			return nil
+		}
+	}
+	newRecord := func(t *testing.T, offset int64) *kgo.Record {
+		rec := newTestRecord(t, "tenant", time.Now())
+		rec.Offset = offset
+		return rec
+	}
+
+	t.Run("appends records while the previous batch flushes", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			proc, m, flushCommitter := newProc(nil)
+
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 1)))
+			m.forceFull = true
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 2)))
+			synctest.Wait()
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+
+			m.forceFull = false
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 3)))
+			require.Equal(t, int64(3), proc.lastOffset)
+			require.Len(t, m.getBuilders(), 1)
+			require.Equal(t, time.Now(), proc.firstAppend)
+
+			flushCommitter.results <- nil
+			require.NoError(t, proc.waitPendingFlush())
+		})
+	})
+
+	t.Run("starts the next flush only after the previous batch commits", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			proc, m, flushCommitter := newProc(nil)
+
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 1)))
+			m.forceFull = true
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 2)))
+
+			processed := make(chan error)
+			go func() { processed <- proc.processRecord(ctx, newRecord(t, 3)) }()
+			synctest.Wait()
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+
+			flushCommitter.results <- nil
+			require.NoError(t, <-processed)
+			synctest.Wait()
+			require.Equal(t, []int64{1, 2}, flushCommitter.startedOffsets())
+
+			flushCommitter.results <- nil
+			require.NoError(t, proc.waitPendingFlush())
+		})
+	})
+
+	t.Run("returns the error of a failed background flush from the next flush", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			proc, m, flushCommitter := newProc(nil)
+
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 1)))
+			m.forceFull = true
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 2)))
+			flushCommitter.results <- errors.New("mock error")
+			synctest.Wait()
+
+			err := proc.processRecord(ctx, newRecord(t, 3))
+			require.ErrorIs(t, err, errUnrecoverableFlush)
+			require.ErrorContains(t, err, "mock error")
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+		})
+	})
+
+	t.Run("stops Run when a background flush fails", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			records := make(chan *kgo.Record)
+			proc, m, flushCommitter := newProc(records)
+
+			ran := make(chan error)
+			go func() { ran <- proc.Run(t.Context()) }()
+			records <- newRecord(t, 1)
+			synctest.Wait()
+			m.forceFull = true
+			records <- newRecord(t, 2)
+			synctest.Wait()
+
+			flushCommitter.results <- errors.New("mock error")
+			err := waitRun(t, ran)
+			require.ErrorIs(t, err, errUnrecoverableFlush)
+			require.ErrorContains(t, err, "mock error")
+		})
+	})
+
+	t.Run("waits for the background flush before Run returns", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			records := make(chan *kgo.Record)
+			proc, m, flushCommitter := newProc(records)
+
+			ran := make(chan error, 1)
+			go func() { ran <- proc.Run(t.Context()) }()
+			records <- newRecord(t, 1)
+			synctest.Wait()
+			m.forceFull = true
+			records <- newRecord(t, 2)
+			synctest.Wait()
+
+			close(records)
+			synctest.Wait()
+			require.Empty(t, ran)
+
+			flushCommitter.results <- nil
+			require.NoError(t, waitRun(t, ran))
+		})
 	})
 }
 

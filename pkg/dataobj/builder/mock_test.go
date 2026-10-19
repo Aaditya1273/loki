@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
@@ -227,6 +228,40 @@ func (m *mockFlushCommitter) Flush(_ context.Context, builders []builder, reason
 	m.lastReason = reason
 	m.lastOffset = offset
 	return nil
+}
+
+// gatedFlushCommitter blocks each Flush until the test sends its result on
+// results, or until the context is canceled. It records the offset of each
+// Flush when the Flush starts. It is safe for concurrent use.
+type gatedFlushCommitter struct {
+	results chan error
+
+	mtx     sync.Mutex
+	offsets []int64
+}
+
+func newGatedFlushCommitter() *gatedFlushCommitter {
+	return &gatedFlushCommitter{results: make(chan error)}
+}
+
+func (m *gatedFlushCommitter) Flush(ctx context.Context, _ []builder, _ string, offset int64) error {
+	m.mtx.Lock()
+	m.offsets = append(m.offsets, offset)
+	m.mtx.Unlock()
+
+	select {
+	case err := <-m.results:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// startedOffsets returns the offsets of the flushes that started, in order.
+func (m *gatedFlushCommitter) startedOffsets() []int64 {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+	return slices.Clone(m.offsets)
 }
 
 // testBuilderFactory creates real [logsobj.Builder] instances backed by an
