@@ -294,13 +294,19 @@ func (p *processor) flushBatch(ctx context.Context, builders []builder, reason s
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, context.Canceled) {
+
+	// A canceled ctx means that the processor stops. Every later flush uses
+	// the same ctx, so it cannot commit a later offset, and a restart reads
+	// this batch again from the last commit.
+	if ctx.Err() != nil {
 		return err
 	}
 
-	// flush failed – in the worst case it failed after a builder was reset but before the
-	// data was uploaded to object storage.
-	return fmt.Errorf("%w: %w", errUnrecoverableFlush, err)
+	// The builders of this batch are already reset, so the processor cannot
+	// flush them again. The error is unrecoverable even when it wraps
+	// context.Canceled: if the processor went on, the next batch would commit
+	// a later offset and skip the records of this one.
+	return fmt.Errorf("%w: %s flush up to offset %d: %w", errUnrecoverableFlush, reason, offset, err)
 }
 
 // waitPendingFlush waits for the background flush to end and returns its
@@ -317,11 +323,16 @@ func (p *processor) waitPendingFlush() error {
 // checkFlushResult returns err if a background flush failed with an
 // unrecoverable error, and nil otherwise.
 func (p *processor) checkFlushResult(err error) error {
-	if !errors.Is(err, errUnrecoverableFlush) {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, errUnrecoverableFlush):
+		level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
+		return err
+	default:
+		level.Info(p.logger).Log("msg", "background flush stopped by shutdown", "err", err)
 		return nil
 	}
-	level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
-	return err
 }
 
 func (p *processor) observeRecord(rec *kgo.Record, now time.Time) {

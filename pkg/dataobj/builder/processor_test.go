@@ -251,10 +251,27 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 		})
 	})
 
-	t.Run("should not escalate a canceled flush", func(t *testing.T) {
-		// During shutdown the flush context is canceled. A canceled flush must
-		// be surfaced as-is rather than escalated to errUnrecoverableFlush, so
-		// the processor shuts down gracefully instead of restarting.
+	t.Run("does not escalate a failure after shutdown cancels the context", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var (
+				ctx, cancel    = context.WithCancel(t.Context())
+				reg            = prometheus.NewRegistry()
+				m              = newTestMultiBuilder()
+				flushCommitter = &fixedErrFlushCommitter{err: errors.New("mock error")}
+				proc           = newProcessor(m, nil, flushCommitter, 5*time.Minute, 30*time.Minute, log.NewNopLogger(), reg)
+			)
+
+			require.NoError(t, proc.processRecord(ctx, newTestRecord(t, "tenant", time.Now())))
+
+			cancel()
+			require.NoError(t, proc.flush(ctx, "forced"))
+			err := proc.waitPendingFlush()
+			require.ErrorContains(t, err, "mock error")
+			require.NotErrorIs(t, err, errUnrecoverableFlush)
+		})
+	})
+
+	t.Run("escalates a canceled error while the context is live", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var (
 				ctx            = t.Context()
@@ -266,11 +283,11 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 
 			require.NoError(t, proc.processRecord(ctx, newTestRecord(t, "tenant", time.Now())))
 
-			time.Sleep(time.Second)
 			require.NoError(t, proc.flush(ctx, "forced"))
 			err := proc.waitPendingFlush()
+			require.ErrorIs(t, err, errUnrecoverableFlush)
 			require.ErrorIs(t, err, context.Canceled)
-			require.NotErrorIs(t, err, errUnrecoverableFlush)
+			require.ErrorContains(t, err, "forced flush up to offset 0")
 		})
 	})
 }
