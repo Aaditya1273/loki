@@ -150,6 +150,24 @@ func (p *processor) Run(ctx context.Context) (returnErr error) {
 		}
 	}()
 
+	// The consumer sends records to p.records. bufferRecords reads them ahead
+	// into records, so the consumer keeps polling while this goroutine is busy.
+	// Cancel it before waiting for it, because it can block on a send that
+	// this goroutine no longer receives.
+	var (
+		records         = make(chan *kgo.Record)
+		bufferCtx, stop = context.WithCancel(ctx)
+		bufferDone      = make(chan struct{})
+	)
+	go func() {
+		defer close(bufferDone)
+		bufferRecords(bufferCtx, p.records, records, prefetchBytes, p.metrics.prefetched)
+	}()
+	defer func() {
+		stop()
+		<-bufferDone
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -165,7 +183,7 @@ func (p *processor) Run(ctx context.Context) (returnErr error) {
 				level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
 				return err
 			}
-		case rec, ok := <-p.records:
+		case rec, ok := <-records:
 			if !ok {
 				level.Info(p.logger).Log("msg", "channel closed")
 				return nil

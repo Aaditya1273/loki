@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -443,6 +444,50 @@ func TestProcessor_ConsumeDuringFlush(t *testing.T) {
 
 			flushCommitter.results <- nil
 			require.NoError(t, waitRun(t, ran))
+		})
+	})
+}
+
+func TestProcessor_Prefetch(t *testing.T) {
+	t.Run("takes records from the consumer while it waits for the previous batch", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			var (
+				records        = make(chan *kgo.Record)
+				m              = newTestMultiBuilder()
+				flushCommitter = newGatedFlushCommitter()
+				proc           = newProcessor(m, records, flushCommitter, 5*time.Minute, 30*time.Minute, log.NewNopLogger(), prometheus.NewRegistry())
+			)
+			ran := make(chan error, 1)
+			go func() { ran <- proc.Run(t.Context()) }()
+
+			records <- newTestRecord(t, "tenant", time.Now())
+			synctest.Wait()
+			m.forceFull = true
+			// The second record starts the flush of the first batch, and the
+			// third waits for it, because the builder stays full.
+			records <- newTestRecord(t, "tenant", time.Now())
+			records <- newTestRecord(t, "tenant", time.Now())
+			synctest.Wait()
+			require.Len(t, flushCommitter.startedOffsets(), 1)
+
+			sent := make(chan struct{})
+			go func() {
+				for range 3 {
+					records <- newTestRecord(t, "tenant", time.Now())
+				}
+				close(sent)
+			}()
+			select {
+			case <-sent:
+			case <-time.After(time.Minute):
+				t.Fatal("the processor took no record while it waited for the previous batch")
+			}
+			require.Positive(t, testutil.ToFloat64(proc.metrics.prefetched))
+
+			close(records)
+			flushCommitter.results <- nil
+			flushCommitter.results <- nil
+			require.NoError(t, <-ran)
 		})
 	})
 }

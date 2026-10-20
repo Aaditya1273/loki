@@ -15,6 +15,7 @@ type metrics struct {
 	records        prometheus.Counter
 	recordFailures prometheus.Counter
 	sizeEstimate   prometheus.Gauge
+	prefetched     prometheus.Gauge
 }
 
 func newMetrics(r prometheus.Registerer) *metrics {
@@ -46,6 +47,10 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		sizeEstimate: promauto.With(r).NewGauge(prometheus.GaugeOpts{
 			Name: "loki_dataobj_builder_size_estimate_bytes",
 			Help: "Current estimated size in bytes buffered across all window-specific builders for the partition.",
+		}),
+		prefetched: promauto.With(r).NewGauge(prometheus.GaugeOpts{
+			Name: "loki_dataobj_builder_prefetched_bytes",
+			Help: "Bytes of Kafka record values that the builder read ahead and did not process yet. Near 0, the builder waits for Kafka. Near the limit, Kafka records wait for the builder.",
 		}),
 	}
 }
