@@ -56,7 +56,7 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		}),
 		flushWaitSeconds: promauto.With(r).NewCounter(prometheus.CounterOpts{
 			Name: "loki_dataobj_builder_flush_wait_seconds_total",
-			Help: "Total time in seconds that the processor waited for the previous batch to flush before it started the next flush. The processor reads no records while it waits.",
+			Help: "Total time in seconds that the processor waited for the previous batch to flush before it started the next flush. The processor appends no records while it waits.",
 		}),
 	}
 }
