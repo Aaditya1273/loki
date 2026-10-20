@@ -77,20 +77,13 @@ type processor struct {
 	// idle timeout. It must be reset after each flush.
 	lastAppend time.Time
 
-	// pending is the batch that flushes in the background, or nil. Only the
-	// goroutine that calls processRecord, idleFlush and flush reads or writes
-	// it.
-	pending *pendingFlush
+	// pending receives the result of the batch that flushes in the
+	// background. It is nil when no batch flushes. Only the goroutine that
+	// calls processRecord, idleFlush and flush reads or writes the field.
+	pending chan error
 
 	metrics *metrics
 	logger  log.Logger
-}
-
-// A pendingFlush is a batch that flushes in the background. err is set
-// before done is closed, and must be read only after that.
-type pendingFlush struct {
-	done chan struct{}
-	err  error
 }
 
 func newProcessor(
@@ -144,8 +137,7 @@ func (p *processor) Run(ctx context.Context) (returnErr error) {
 	// A background flush must not outlive the processor. It uses ctx, so it
 	// stops soon after a shutdown cancels ctx.
 	defer func() {
-		if err := p.waitPendingFlush(); returnErr == nil && errors.Is(err, errUnrecoverableFlush) {
-			level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
+		if err := p.checkFlushResult(p.waitPendingFlush()); returnErr == nil {
 			returnErr = err
 		}
 	}()
@@ -157,12 +149,11 @@ func (p *processor) Run(ctx context.Context) (returnErr error) {
 			// We don't return ctx.Err() here as it manifests as a service failure
 			// when stopping the service.
 			return nil
-		case <-p.pendingFlushDone():
-			// The flush ended, so waitPendingFlush does not block. A failure
-			// stops the processor now, not at the next flush, so it does not
-			// append records that it can never commit.
-			if err := p.waitPendingFlush(); errors.Is(err, errUnrecoverableFlush) {
-				level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
+		case err := <-p.pending:
+			// A failure stops the processor now, not at the next flush, so it
+			// does not append records that it can never commit.
+			p.pending = nil
+			if err := p.checkFlushResult(err); err != nil {
 				return err
 			}
 		case rec, ok := <-p.records:
@@ -291,12 +282,10 @@ func (p *processor) flush(ctx context.Context, reason string) error {
 		return err
 	}
 
-	pending := &pendingFlush{done: make(chan struct{})}
+	// The buffer lets the goroutine exit before anyone reads the result.
+	pending := make(chan error, 1)
 	p.pending = pending
-	go func() {
-		defer close(pending.done)
-		pending.err = p.flushBatch(ctx, builders, reason, offset)
-	}()
+	go func() { pending <- p.flushBatch(ctx, builders, reason, offset) }()
 	return nil
 }
 
@@ -314,24 +303,24 @@ func (p *processor) flushBatch(ctx context.Context, builders []builder, reason s
 	return fmt.Errorf("%w: %w", errUnrecoverableFlush, err)
 }
 
-// pendingFlushDone returns a channel that is closed when the background flush
-// ends, or nil when no flush runs in the background.
-func (p *processor) pendingFlushDone() <-chan struct{} {
-	if p.pending == nil {
-		return nil
-	}
-	return p.pending.done
-}
-
 // waitPendingFlush waits for the background flush to end and returns its
 // error. It returns nil when no flush runs in the background.
 func (p *processor) waitPendingFlush() error {
 	if p.pending == nil {
 		return nil
 	}
-	<-p.pending.done
-	err := p.pending.err
+	err := <-p.pending
 	p.pending = nil
+	return err
+}
+
+// checkFlushResult returns err if a background flush failed with an
+// unrecoverable error, and nil otherwise.
+func (p *processor) checkFlushResult(err error) error {
+	if !errors.Is(err, errUnrecoverableFlush) {
+		return nil
+	}
+	level.Error(p.logger).Log("msg", "terminating after unrecoverable background flush", "err", err)
 	return err
 }
 
