@@ -15,6 +15,9 @@ type metrics struct {
 	records        prometheus.Counter
 	recordFailures prometheus.Counter
 	sizeEstimate   prometheus.Gauge
+
+	flushingSizeEstimate prometheus.Gauge
+	flushWaitSeconds     prometheus.Counter
 }
 
 func newMetrics(r prometheus.Registerer) *metrics {
@@ -45,7 +48,15 @@ func newMetrics(r prometheus.Registerer) *metrics {
 		}),
 		sizeEstimate: promauto.With(r).NewGauge(prometheus.GaugeOpts{
 			Name: "loki_dataobj_builder_size_estimate_bytes",
-			Help: "Current estimated size in bytes buffered across all window-specific builders for the partition.",
+			Help: "Current estimated size in bytes buffered across all window-specific builders for the partition. It does not include the batch that flushes in the background.",
+		}),
+		flushingSizeEstimate: promauto.With(r).NewGauge(prometheus.GaugeOpts{
+			Name: "loki_dataobj_builder_flushing_size_estimate_bytes",
+			Help: "Estimated size in bytes of the batch that flushes in the background, or 0 if no batch flushes.",
+		}),
+		flushWaitSeconds: promauto.With(r).NewCounter(prometheus.CounterOpts{
+			Name: "loki_dataobj_builder_flush_wait_seconds_total",
+			Help: "Total time in seconds that the processor waited for the previous batch to flush before it started the next flush. The processor reads no records while it waits.",
 		}),
 	}
 }

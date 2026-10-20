@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/twmb/franz-go/pkg/kgo"
 
@@ -396,6 +397,36 @@ func TestProcessor_ConsumeDuringFlush(t *testing.T) {
 
 			flushCommitter.results <- nil
 			require.NoError(t, proc.waitPendingFlush())
+		})
+	})
+
+	t.Run("reports the size of the flushing batch and the time spent waiting for it", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			proc, m, flushCommitter := newProc(nil)
+
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 1)))
+			firstSize := float64(m.GetEstimatedSize())
+			m.forceFull = true
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 2)))
+			secondSize := float64(m.GetEstimatedSize())
+			require.Equal(t, firstSize, testutil.ToFloat64(proc.metrics.flushingSizeEstimate))
+			require.Equal(t, secondSize, testutil.ToFloat64(proc.metrics.sizeEstimate))
+
+			processed := make(chan error)
+			go func() { processed <- proc.processRecord(ctx, newRecord(t, 3)) }()
+			time.Sleep(10 * time.Second)
+			require.Equal(t, firstSize, testutil.ToFloat64(proc.metrics.flushingSizeEstimate))
+			require.Equal(t, secondSize, testutil.ToFloat64(proc.metrics.sizeEstimate))
+
+			flushCommitter.results <- nil
+			require.NoError(t, <-processed)
+			require.Equal(t, 10.0, testutil.ToFloat64(proc.metrics.flushWaitSeconds))
+			require.Equal(t, secondSize, testutil.ToFloat64(proc.metrics.flushingSizeEstimate))
+
+			flushCommitter.results <- nil
+			require.NoError(t, proc.waitPendingFlush())
+			require.Zero(t, testutil.ToFloat64(proc.metrics.flushingSizeEstimate))
 		})
 	})
 

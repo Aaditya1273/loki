@@ -269,23 +269,33 @@ func (p *processor) needsIdleFlush() bool {
 // flush first waits for the previous batch, so batches commit their offsets
 // in order, and at most two batches are in memory.
 func (p *processor) flush(ctx context.Context, reason string) error {
-	builders, offset := p.builder.getBuilders(), p.lastOffset
+	builders, offset, size := p.builder.getBuilders(), p.lastOffset, p.builder.GetEstimatedSize()
 
 	// Reset the state to prepare for building the next data objects. Reset
 	// drops the builders from p.builder, and the batch keeps them.
 	p.firstAppend = time.Time{}
 	p.lastAppend = time.Time{}
 	p.builder.Reset()
-	p.metrics.sizeEstimate.Set(0)
 
-	if err := p.waitPendingFlush(); err != nil {
+	// The size estimate keeps this batch while it waits, so that the two size
+	// gauges add up to the batches in memory.
+	waitStart := time.Now()
+	err := p.waitPendingFlush()
+	p.metrics.flushWaitSeconds.Add(time.Since(waitStart).Seconds())
+	p.metrics.sizeEstimate.Set(0)
+	if err != nil {
 		return err
 	}
 
 	// The buffer lets the goroutine exit before anyone reads the result.
 	pending := make(chan error, 1)
 	p.pending = pending
-	go func() { pending <- p.flushBatch(ctx, builders, reason, offset) }()
+	p.metrics.flushingSizeEstimate.Set(float64(size))
+	go func() {
+		err := p.flushBatch(ctx, builders, reason, offset)
+		p.metrics.flushingSizeEstimate.Set(0)
+		pending <- err
+	}()
 	return nil
 }
 
