@@ -331,7 +331,7 @@ func (p *processor) waitPendingFlush() error {
 }
 
 // checkFlushResult returns err if a background flush failed with an
-// unrecoverable error, and nil otherwise.
+// unrecoverable error, and nil otherwise. It logs every error.
 func (p *processor) checkFlushResult(err error) error {
 	switch {
 	case err == nil:

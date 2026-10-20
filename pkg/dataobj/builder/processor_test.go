@@ -3,8 +3,11 @@ package builder
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -13,11 +16,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore"
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/grafana/loki/v3/pkg/dataobj"
+	"github.com/grafana/loki/v3/pkg/dataobj/index"
+	"github.com/grafana/loki/v3/pkg/dataobj/index/indexobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/logsobj"
 	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
+	dataobj_uploader "github.com/grafana/loki/v3/pkg/dataobj/uploader"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/scratch"
 
@@ -213,7 +220,7 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 			require.NoError(t, proc.waitPendingFlush())
 			require.Equal(t, 1, flushCommitter.flushes)
 
-			// The following fields should be reset at the end of every flush.
+			// flush resets these fields when it hands off the batch.
 			require.True(t, proc.firstAppend.IsZero())
 			require.True(t, proc.lastAppend.IsZero())
 		})
@@ -246,7 +253,8 @@ func TestPartitionProcessor_Flush(t *testing.T) {
 			require.ErrorIs(t, err, errUnrecoverableFlush)
 			require.ErrorContains(t, err, "mock error")
 
-			// Despite the failure, the following fields should still be reset.
+			// flush reset these fields when it handed off the batch, before
+			// the batch failed.
 			require.True(t, proc.firstAppend.IsZero())
 			require.True(t, proc.lastAppend.IsZero())
 		})
@@ -323,7 +331,7 @@ func TestPartitionProcessor_FlushSplitsAcrossTenantsAndWindows(t *testing.T) {
 		require.Equal(t, 5, flushCommitter.lastBuilderCount)
 		require.Equal(t, rec.Offset, flushCommitter.lastOffset)
 
-		// The multi-builder is reset after a successful flush.
+		// flush resets the multi-builder when it hands off the batch.
 		require.Empty(t, m.getBuilders())
 		require.Equal(t, 0, m.GetEstimatedSize())
 	})
@@ -489,6 +497,217 @@ func TestProcessor_ConsumeDuringFlush(t *testing.T) {
 			require.NoError(t, waitRun(t, ran))
 		})
 	})
+
+	t.Run("keeps the flushing builders apart from the builders that receive new records", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx := t.Context()
+			proc, m, flushCommitter := newProc(nil)
+
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 1)))
+			m.forceFull = true
+			require.NoError(t, proc.processRecord(ctx, newRecord(t, 2)))
+			m.forceFull = false
+			synctest.Wait()
+
+			flushing := flushCommitter.startedBuilders()[0]
+			require.Len(t, flushing, 1)
+			flushingSize := flushing[0].GetEstimatedSize()
+
+			// The records have the tenant and window of the flushing builder.
+			// They must go to a new builder all the same.
+			for offset := int64(3); offset < 10; offset++ {
+				require.NoError(t, proc.processRecord(ctx, newRecord(t, offset)))
+			}
+			require.Equal(t, flushingSize, flushing[0].GetEstimatedSize())
+			require.Len(t, m.getBuilders(), 1)
+			require.NotSame(t, flushing[0], m.getBuilders()[0])
+
+			flushCommitter.results <- nil
+			require.NoError(t, proc.waitPendingFlush())
+		})
+	})
+
+	t.Run("stops reading records while the next batch waits for the previous flush", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			records := make(chan *kgo.Record)
+			proc, m, flushCommitter := newProc(records)
+
+			ran := make(chan error, 1)
+			go func() { ran <- proc.Run(t.Context()) }()
+			records <- newRecord(t, 1)
+			synctest.Wait()
+			m.forceFull = true
+			records <- newRecord(t, 2)
+			records <- newRecord(t, 3)
+			synctest.Wait()
+
+			select {
+			case records <- newRecord(t, 4):
+				t.Fatal("Run read a record while the next batch waited for the previous flush")
+			default:
+			}
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+
+			m.forceFull = false
+			flushCommitter.results <- nil
+			records <- newRecord(t, 4)
+			synctest.Wait()
+			require.Equal(t, []int64{1, 2}, flushCommitter.startedOffsets())
+			require.Equal(t, 1, flushCommitter.maxConcurrentFlushes())
+
+			flushCommitter.results <- nil
+			close(records)
+			require.NoError(t, waitRun(t, ran))
+		})
+	})
+
+	t.Run("starts an idle flush only after the previous batch commits", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			records := make(chan *kgo.Record)
+			proc, m, flushCommitter := newProc(records)
+
+			ran := make(chan error, 1)
+			go func() { ran <- proc.Run(t.Context()) }()
+			records <- newRecord(t, 1)
+			synctest.Wait()
+			m.forceFull = true
+			records <- newRecord(t, 2)
+			synctest.Wait()
+			m.forceFull = false
+
+			// The idle flush timeout is 5 minutes. The first timer fires at
+			// exactly 5 minutes, which is not past the timeout, so the idle
+			// flush starts at the second timer.
+			time.Sleep(11 * time.Minute)
+			synctest.Wait()
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+
+			flushCommitter.results <- nil
+			synctest.Wait()
+			require.Equal(t, []int64{1, 2}, flushCommitter.startedOffsets())
+			require.Equal(t, []string{flushReasonBuilderFull, flushReasonIdle}, flushCommitter.startedReasons())
+
+			flushCommitter.results <- nil
+			close(records)
+			require.NoError(t, waitRun(t, ran))
+		})
+	})
+
+	t.Run("starts no later flush when Run stops while a batch waits for the previous flush", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			records := make(chan *kgo.Record)
+			proc, m, flushCommitter := newProc(records)
+
+			ran := make(chan error, 1)
+			go func() { ran <- proc.Run(ctx) }()
+			records <- newRecord(t, 1)
+			synctest.Wait()
+			m.forceFull = true
+			records <- newRecord(t, 2)
+			records <- newRecord(t, 3)
+			synctest.Wait()
+
+			cancel()
+			require.NoError(t, waitRun(t, ran))
+			require.Equal(t, []int64{1}, flushCommitter.startedOffsets())
+		})
+	})
+
+	t.Run("builds the same data objects and indexes as a flush that blocks consumption", func(t *testing.T) {
+		batches := newTestBatches(t, 3, 300)
+
+		serialObjects, serialOffsets := flushWithRealStack(t, batches, true)
+		objects, offsets := flushWithRealStack(t, batches, false)
+
+		require.NotEmpty(t, serialObjects)
+		require.Equal(t, serialOffsets, offsets)
+		require.Equal(t, slices.Sorted(maps.Keys(serialObjects)), slices.Sorted(maps.Keys(objects)))
+		for name, data := range serialObjects {
+			require.Equal(t, data, objects[name], "object %s", name)
+		}
+	})
+}
+
+// newTestBatches returns n batches of size records each, with offsets that
+// increase across batches. The records belong to three tenants and span two
+// ToC windows. The entries of each stream are out of order, so the sort has
+// work to do.
+func newTestBatches(t *testing.T, n, size int) [][]*kgo.Record {
+	base := time.Date(2026, time.October, 1, 6, 0, 0, 0, time.UTC)
+	var (
+		batches [][]*kgo.Record
+		offset  int64
+	)
+	for b := range n {
+		var batch []*kgo.Record
+		for i := range size {
+			ts := base.Add(time.Duration(b*size+(i*37)%size) * time.Minute)
+			stream := logproto.Stream{
+				Labels:  fmt.Sprintf(`{app="app-%d", pod="pod-%d"}`, i%4, i%7),
+				Entries: []push.Entry{{Timestamp: ts, Line: fmt.Sprintf("level=info batch=%d line=%d", b, i)}},
+			}
+			value, err := stream.Marshal()
+			require.NoError(t, err)
+			batch = append(batch, &kgo.Record{
+				Key:       []byte(fmt.Sprintf("tenant-%d", i%3)),
+				Value:     value,
+				Timestamp: ts,
+				Offset:    offset,
+			})
+			offset++
+		}
+		batches = append(batches, batch)
+	}
+	return batches
+}
+
+// flushWithRealStack appends each batch to a processor and flushes it as one
+// batch. The flush uses the production sort, upload, index and ToC writer
+// with an in-memory bucket. It returns the contents of the bucket and the
+// committed offsets.
+//
+// If serial is true, it waits for each flush before it appends the next
+// batch. The processor read no records during a flush before batches flushed
+// in the background.
+func flushWithRealStack(t *testing.T, batches [][]*kgo.Record, serial bool) (map[string][]byte, []int64) {
+	var cfg Config
+	cfg.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+	cfg.LogsobjBuilder.DropDuplicates = true
+
+	var (
+		ctx          = t.Context()
+		logger       = log.NewNopLogger()
+		reg          = prometheus.NewRegistry()
+		scratchStore = scratch.NewMemory()
+		bucket       = objstore.NewInMemBucket()
+		idxBucket    = objstore.NewPrefixedBucket(bucket, "index/")
+		committer    = &mockCommitter{}
+	)
+	factory, err := logsobj.NewBuilderFactory(cfg.LogsobjBuilder, scratchStore, logsobj.NewBuilderMetrics(), logger, nil)
+	require.NoError(t, err)
+	indexobjMetrics := indexobj.NewBuilderMetrics(reg)
+	indexer, err := index.NewSimpleIndexer(cfg.IndexobjBuilder, scratchStore, logger, idxBucket, index.NewIndexerMetrics(reg), indexobjMetrics, index.NewCalculatorMetrics(reg))
+	require.NoError(t, err)
+	var (
+		uploader       = dataobj_uploader.New(dataobj_uploader.Config{SHAPrefixSize: 2}, bucket, logger)
+		flusher        = newFlusher(logsobj.NewSorter(factory, reg), uploader, logger, reg)
+		tocWriter      = metastore.NewTableOfContentsWriter(idxBucket, metastore.DefaultTocWriterBackoffConfig, metastore.DefaultTocBuilderConfig, logger, metastore.NewTocWriterMetrics(reg), indexobjMetrics)
+		flushCommitter = newFlushCommitter(flusher, committer, indexer, tocWriter, 0, 1, logger, reg)
+		proc           = newProcessor(NewMultiObjectBuilder(factory, int(cfg.LogsobjBuilder.TargetObjectSize)), nil, flushCommitter, time.Hour, 0, logger, reg)
+	)
+
+	for _, batch := range batches {
+		for _, rec := range batch {
+			require.NoError(t, proc.processRecord(ctx, rec))
+		}
+		require.NoError(t, proc.flush(ctx, "test"))
+		if serial {
+			require.NoError(t, proc.waitPendingFlush())
+		}
+	}
+	require.NoError(t, proc.waitPendingFlush())
+	return maps.Clone(bucket.Objects()), committer.offsets
 }
 
 // newTestBuilder returns a new logsobj.Builder with registered metrics.
